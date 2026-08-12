@@ -6,7 +6,6 @@ import logging
 from typing import List, Any, Dict, Optional
 import os
 import asyncio
-import time
 from urllib.parse import urlparse
 
 from content import ContentSourceAdapter, ContentItem, ContentType
@@ -108,6 +107,47 @@ async def _fetch_text(session: aiohttp.ClientSession, url: str, **kwargs) -> Opt
     except Exception as e:
         log.warning(f"Failed to read text from {url}: {e}")
         return None
+
+
+# Date parsing helper -------------------------------------------------------
+from email.utils import parsedate_to_datetime
+
+
+def _parse_xml_date(date_str: Optional[str]) -> datetime:
+    """
+    Safely parse common RSS/Atom date strings into a timezone-aware datetime.
+    Falls back to current UTC time on parse failure. Never raises.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return datetime.now(timezone.utc)
+
+    # Try RFC-2822 / RFC-822 parsing first (Email-style date formats)
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt is None:
+            raise ValueError("parsedate_to_datetime returned None")
+        # parsedate_to_datetime may return naive datetime for some inputs; ensure tz-aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        pass
+
+    # Try ISO-8601 fallback
+    try:
+        # Normalize 'Z' -> '+00:00' for fromisoformat
+        s = date_str.strip()
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        pass
+
+    # Final safe fallback
+    return datetime.now(timezone.utc)
 
 
 # Adapters -------------------------------------------------------------------
