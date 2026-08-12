@@ -245,6 +245,7 @@ def format_content_embed(item: ContentItem, guild_id: int) -> discord.Embed:
         
     return embed
 
+
 async def process_content_source(bot: commands.Bot, source: dict) -> int:
     guild_id = source['guild_id']
     source_id = source['source_id']
@@ -273,53 +274,111 @@ async def process_content_source(bot: commands.Bot, source: dict) -> int:
         try:
             await db.execute(
                 "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (guild_id, "content_fetch_failure", f'{{"source": "{source_id}"}}')
+                (guild_id, "content_fetch_failure", f'{"source": "{source_id}"}')
             )
         except: pass
         return 0
         
     published_count = 0
-    for item in items:
-        if not adapter.validate(item): continue
-        if await content_service.check_duplicate(guild_id, item.fingerprint): continue
-        
-        # New item!
-        if await content_service.save_item(guild_id, item):
-            # Publish
+    # Bound processing to avoid unbounded work per source
+    PROCESS_MAX_ITEMS = 15
+    if not isinstance(items, list):
+        items = []
+
+    for item in items[:PROCESS_MAX_ITEMS]:
+        try:
+            # Validate item via adapter (defensive)
+            try:
+                is_valid = adapter.validate(item)
+            except Exception as e:
+                log.warning(f"Adapter validation failed for item from {source_id}: {e}")
+                continue
+
+            if not is_valid:
+                continue
+
+            # Compute fingerprint defensively
+            try:
+                fp = item.fingerprint
+            except Exception as e:
+                log.warning(f"Failed to compute fingerprint for item {getattr(item, 'external_id', None)}: {e}")
+                continue
+
+            # Duplicate check
+            try:
+                if await content_service.check_duplicate(guild_id, fp):
+                    continue
+            except Exception as e:
+                log.warning(f"Duplicate check failed for {fp}: {e}")
+                # Skip this item rather than aborting the entire source
+                continue
+            
+            # Persist item
+            try:
+                saved = await content_service.save_item(guild_id, item)
+            except Exception as e:
+                log.error(f"save_item raised for {getattr(item, 'external_id', None)}: {e}")
+                saved = False
+
+            if not saved:
+                continue
+
+            # Publish to Discord if channel configured
             if channel_id:
                 channel = bot.get_channel(channel_id)
                 if channel:
-                    embed = format_content_embed(item, guild_id)
-                    view = discord.ui.View()
-                    view.add_item(discord.ui.Button(label="View Content", url=item.url, style=discord.ButtonStyle.link))
                     try:
-                        msg = await channel.send(embed=embed, view=view)
-                        await content_service.mark_published(guild_id, item.fingerprint, msg.id)
-                        published_count += 1
+                        embed = format_content_embed(item, guild_id)
+                        view = discord.ui.View()
+                        view.add_item(discord.ui.Button(label="View Content", url=item.url, style=discord.ButtonStyle.link))
+
                         try:
-                            await db.execute(
-                                "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                                (guild_id, "content_published", f'{{"source": "{source_id}", "item": "{item.external_id}"}}')
-                            )
-                        except: pass
+                            msg = await channel.send(embed=embed, view=view)
+                        except Exception as e:
+                            log.error(f"Failed to send to channel {channel_id} for source {source_id}: {e}")
+                            # Do not mark as published; continue processing other items
+                            msg = None
+
+                        if msg:
+                            try:
+                                await content_service.mark_published(guild_id, fp, msg.id)
+                                published_count += 1
+                                try:
+                                    await db.execute(
+                                        "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                                        (guild_id, "content_published", f'{"source": "{source_id}", "item": "{item.external_id}"}')
+                                    )
+                                except: pass
+                            except Exception as e:
+                                log.warning(f"Failed to mark_published for {fp}: {e}")
                     except Exception as e:
-                        log.error(f"Failed to send to channel {channel_id}: {e}")
+                        log.error(f"Unhandled publishing error for source {source_id}: {e}")
                 else:
                     log.warning(f"Channel {channel_id} not found for {source_id}")
+
+            # Log discovery (best-effort)
+            try:
+                await db.execute(
+                    "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                    (guild_id, "content_discovered", f'{"source": "{source_id}", "item": "{item.external_id}"}')
+                )
+            except: pass
+
+        except Exception as e:
+            # Catch-all per-item to ensure one bad item cannot stop the whole source
+            log.error(f"Error processing item from source {source_id}: {e}")
+            continue
                     
-        # Log discovery
-        try:
-            await db.execute(
-                "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (guild_id, "content_discovered", f'{{"source": "{source_id}", "item": "{item.external_id}"}}')
-            )
-        except: pass
-                    
-    await content_service.update_source_status(guild_id, source_id, True)
+    # Mark source as successfully processed (fetch & processing completed)
+    try:
+        await content_service.update_source_status(guild_id, source_id, True)
+    except Exception as e:
+        log.warning(f"Failed to update source status for {source_id}: {e}")
+
     try:
         await db.execute(
             "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-            (guild_id, "content_fetch_success", f'{{"source": "{source_id}", "published": {published_count}}}')
+            (guild_id, "content_fetch_success", f'{"source": "{source_id}", "published": {published_count}}')
         )
     except: pass
     return published_count
