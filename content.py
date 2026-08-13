@@ -246,6 +246,65 @@ def format_content_embed(item: ContentItem, guild_id: int) -> discord.Embed:
     return embed
 
 
+async def _send_with_retry(channel: discord.abc.Messageable, embed: discord.Embed, view: Optional[discord.ui.View], source_id: str, item_external_id: str, max_attempts: int = 2) -> Optional[discord.Message]:
+    """
+    Conservative retry helper for sending messages to Discord.
+    - Retries only on clearly retryable HTTP errors (429 or 5xx when surfaced by discord.py).
+    - Does not retry on NotFound/Forbidden or ambiguous errors to avoid duplicates.
+    - Returns the discord.Message on success, or None on permanent failure.
+    """
+    attempt = 0
+    backoffs = [1, 3]
+    while attempt < max_attempts:
+        try:
+            msg = await channel.send(embed=embed, view=view)
+            return msg
+        except discord.HTTPException as he:
+            # discord.HTTPException may have status attribute in some cases
+            status = getattr(he, 'status', None)
+            # If rate-limited or server error, consider retrying once
+            retryable = False
+            if status == 429:
+                retryable = True
+            elif isinstance(status, int) and status >= 500:
+                retryable = True
+
+            # Log and record retry attempt
+            try:
+                await db.execute(
+                    "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                    (channel.guild.id if getattr(channel, 'guild', None) else 0, "publish_retry_attempt", json.dumps({"source": source_id, "item": item_external_id, "attempt": attempt + 1, "error": str(status or he)}))
+                )
+            except: pass
+
+            if not retryable or attempt + 1 >= max_attempts:
+                # Permanent failure; record and return None
+                try:
+                    await db.execute(
+                        "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                        (channel.guild.id if getattr(channel, 'guild', None) else 0, "publish_permanent_failure", json.dumps({"source": source_id, "item": item_external_id, "error": str(status or he)}))
+                    )
+                except: pass
+                log.error(f"Permanent publish failure for source {source_id} item {item_external_id}: {he}")
+                return None
+
+            # Otherwise backoff and retry
+            wait = backoffs[min(attempt, len(backoffs)-1)]
+            await asyncio.sleep(wait)
+            attempt += 1
+            continue
+        except Exception as e:
+            # For ambiguous errors, do not retry to avoid duplicate posts
+            try:
+                await db.execute(
+                    "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                    (getattr(channel, 'guild', None).id if getattr(channel, 'guild', None) else 0, "publish_permanent_failure", json.dumps({"source": source_id, "item": item_external_id, "error": str(e)}))
+                )
+            except: pass
+            log.error(f"Non-retryable publish error for source {source_id} item {item_external_id}: {e}")
+            return None
+
+
 async def process_content_source(bot: commands.Bot, source: dict) -> int:
     guild_id = source['guild_id']
     source_id = source['source_id']
@@ -332,12 +391,8 @@ async def process_content_source(bot: commands.Bot, source: dict) -> int:
                         view = discord.ui.View()
                         view.add_item(discord.ui.Button(label="View Content", url=item.url, style=discord.ButtonStyle.link))
 
-                        try:
-                            msg = await channel.send(embed=embed, view=view)
-                        except Exception as e:
-                            log.error(f"Failed to send to channel {channel_id} for source {source_id}: {e}")
-                            # Do not mark as published; continue processing other items
-                            msg = None
+                        # Use conservative retry helper
+                        msg = await _send_with_retry(channel, embed, view, source_id, item.external_id, max_attempts=2)
 
                         if msg:
                             try:
@@ -424,120 +479,3 @@ class ContentGroup(app_commands.Group):
         sources = await content_service.get_sources(interaction.guild_id)
         embed = build_content_embed(interaction.guild, sources)
         await interaction.response.send_message(embed=embed, view=ContentSourceView())
-
-    @app_commands.command(name="configure", description="Configure a new content source.")
-    @app_commands.describe(
-        source_id="Unique identifier (e.g. modrinth_news)",
-        source_type="Type of source (e.g. MODRINTH, REDDIT)",
-        url="Target URL or identifier",
-        channel="Channel to post updates"
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def configure(self, interaction: discord.Interaction, source_id: str, source_type: str, url: str, channel: discord.TextChannel):
-        if not await is_manager_or_higher(interaction.user):
-            await interaction.response.send_message(embed=VeyraEmbed.error("Permission Denied", "You need Manager permissions."), ephemeral=True)
-            return
-            
-        success = await content_service.add_source(interaction.guild_id, source_id, source_type, url, channel.id)
-        if success:
-            await interaction.response.send_message(embed=VeyraEmbed.success("Source Configured", f"Successfully configured content source `{source_id}` in {channel.mention}."), ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=VeyraEmbed.error("Configuration Failed", f"Failed to configure source `{source_id}`."), ephemeral=True)
-            
-    @app_commands.command(name="disable", description="Disable a content source.")
-    @app_commands.describe(source_id="Unique identifier")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def disable(self, interaction: discord.Interaction, source_id: str):
-        if not await is_manager_or_higher(interaction.user):
-            await interaction.response.send_message(embed=VeyraEmbed.error("Permission Denied", "You need Manager permissions."), ephemeral=True)
-            return
-            
-        success = await content_service.set_source_status(interaction.guild_id, source_id, False)
-        if success:
-            await interaction.response.send_message(embed=VeyraEmbed.success("Source Disabled", f"Source `{source_id}` disabled."), ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=VeyraEmbed.error("Not Found", f"Source `{source_id}` not found."), ephemeral=True)
-            
-    @app_commands.command(name="test", description="Test fetch a content source without publishing.")
-    @app_commands.describe(source_id="Unique identifier")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def test(self, interaction: discord.Interaction, source_id: str):
-        if not await is_manager_or_higher(interaction.user):
-            await interaction.response.send_message(embed=VeyraEmbed.error("Permission Denied", "You need Manager permissions."), ephemeral=True)
-            return
-            
-        await interaction.response.defer(ephemeral=True)
-        sources = await content_service.get_sources(interaction.guild_id)
-        source = next((s for s in sources if s['source_id'] == source_id), None)
-        
-        if not source:
-            await interaction.followup.send(embed=VeyraEmbed.error("Not Found", f"Source `{source_id}` not found."))
-            return
-            
-        import json
-        config = {}
-        if source.get('config_json'):
-            try: config = json.loads(source['config_json'])
-            except: pass
-            
-        from content_adapters import get_adapter
-        adapter = get_adapter(source['type'], source_id, interaction.guild_id, source['url'], config)
-        if not adapter:
-            await interaction.followup.send(embed=VeyraEmbed.error("Adapter Error", f"Could not load adapter for `{source['type']}`."))
-            return
-            
-        try:
-            items = await adapter.fetch()
-        except Exception as e:
-            await interaction.followup.send(embed=VeyraEmbed.error("Fetch Error", f"Error during fetch: {e}"))
-            return
-            
-        if not items:
-            await interaction.followup.send(embed=VeyraEmbed.warning("No Content", "Adapter returned no items or failed internally."))
-            return
-            
-        valid_items = [i for i in items if adapter.validate(i)]
-        
-        embed = VeyraEmbed.success("Test Fetch Successful", f"Fetched {len(valid_items)} valid items from `{source_id}`.")
-        if valid_items:
-            first = valid_items[0]
-            embed.add_field(name="Latest Item Preview", value=f"**{first.title}**\n{first.url}\nID: {first.external_id}", inline=False)
-            
-        await interaction.followup.send(embed=embed)
-
-    @app_commands.command(name="fetch", description="Manually trigger a fetch for a source.")
-    @app_commands.describe(source_id="Unique identifier")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def fetch(self, interaction: discord.Interaction, source_id: str):
-        if not await is_manager_or_higher(interaction.user):
-            await interaction.response.send_message(embed=VeyraEmbed.error("Permission Denied", "You need Manager permissions."), ephemeral=True)
-            return
-            
-        await interaction.response.defer(ephemeral=True)
-        sources = await content_service.get_sources(interaction.guild_id)
-        source = next((s for s in sources if s['source_id'] == source_id), None)
-        
-        if not source:
-            await interaction.followup.send(embed=VeyraEmbed.error("Not Found", f"Source `{source_id}` not found."))
-            return
-            
-        if not source['enabled']:
-            await interaction.followup.send(embed=VeyraEmbed.error("Disabled", f"Source `{source_id}` is disabled. Enable it first."))
-            return
-            
-        count = await process_content_source(interaction.client, source)
-        await interaction.followup.send(embed=VeyraEmbed.success("Fetch Complete", f"Processed `{source_id}`. Published **{count}** new items."))
-
-    @app_commands.command(name="enable", description="Enable a content source.")
-    @app_commands.describe(source_id="Unique identifier")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def enable(self, interaction: discord.Interaction, source_id: str):
-        if not await is_manager_or_higher(interaction.user):
-            await interaction.response.send_message(embed=VeyraEmbed.error("Permission Denied", "You need Manager permissions."), ephemeral=True)
-            return
-            
-        success = await content_service.set_source_status(interaction.guild_id, source_id, True)
-        if success:
-            await interaction.response.send_message(embed=VeyraEmbed.success("Source Enabled", f"Source `{source_id}` enabled."), ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=VeyraEmbed.error("Not Found", f"Source `{source_id}` not found."), ephemeral=True)
