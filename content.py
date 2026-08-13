@@ -274,7 +274,7 @@ async def process_content_source(bot: commands.Bot, source: dict) -> int:
         try:
             await db.execute(
                 "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (guild_id, "content_fetch_failure", f'{"source": "{source_id}"}')
+                (guild_id, "content_fetch_failure", json.dumps({"source": source_id}))
             )
         except: pass
         return 0
@@ -346,7 +346,7 @@ async def process_content_source(bot: commands.Bot, source: dict) -> int:
                                 try:
                                     await db.execute(
                                         "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                                        (guild_id, "content_published", f'{"source": "{source_id}", "item": "{item.external_id}"}')
+                                        (guild_id, "content_published", json.dumps({"source": source_id, "item": item.external_id}))
                                     )
                                 except: pass
                             except Exception as e:
@@ -360,7 +360,7 @@ async def process_content_source(bot: commands.Bot, source: dict) -> int:
             try:
                 await db.execute(
                     "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                    (guild_id, "content_discovered", f'{"source": "{source_id}", "item": "{item.external_id}"}')
+                    (guild_id, "content_discovered", json.dumps({"source": source_id, "item": item.external_id}))
                 )
             except: pass
 
@@ -378,7 +378,7 @@ async def process_content_source(bot: commands.Bot, source: dict) -> int:
     try:
         await db.execute(
             "INSERT INTO analytics_events (guild_id, event_type, metadata, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-            (guild_id, "content_fetch_success", f'{"source": "{source_id}", "published": {published_count}}')
+            (guild_id, "content_fetch_success", json.dumps({"source": source_id, "published": published_count}))
         )
     except: pass
     return published_count
@@ -541,4 +541,3 @@ class ContentGroup(app_commands.Group):
             await interaction.response.send_message(embed=VeyraEmbed.success("Source Enabled", f"Source `{source_id}` enabled."), ephemeral=True)
         else:
             await interaction.response.send_message(embed=VeyraEmbed.error("Not Found", f"Source `{source_id}` not found."), ephemeral=True)
-
